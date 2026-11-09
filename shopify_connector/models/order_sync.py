@@ -640,6 +640,7 @@ class ShopifyOrderSync(models.Model):
             )
         binding.odoo_id = sale_order
         self._apply_lines(binding, sale_order, instance, order_data)
+        self._sync_discount_rounding_line(sale_order, currency, instance, order_data)
         self._verify_total(sale_order, currency, instance, order_data)
         return sale_order
 
@@ -1155,6 +1156,72 @@ class ShopifyOrderSync(models.Model):
                 )
             taxes |= mapping.tax_id
         return taxes
+
+    def _sync_discount_rounding_line(self, sale_order, currency, instance, order_data):
+        """Add a line for the cents that the stored discount percents lose.
+
+        Odoo stores a line discount with the "Discount" precision (2 digits by
+        default). On a large line the rounded percent moves the line total by
+        a few cents. The line takes only the difference that the rounded
+        percents explain, so a real mismatch still fails the total check.
+        """
+        line = sale_order.order_line.filtered("shopify_discount_rounding")[:1]
+        others = sale_order.order_line - line
+        sale_order.invalidate_recordset(["amount_total"])
+        amount = decimal_amount(
+            self._shopify_expected_order_total(instance, order_data)
+        ) - (Decimal(str(sale_order.amount_total)) - Decimal(str(line.price_total)))
+        explained = sum(
+            (self._discount_rounding_drift(item) for item in others), Decimal("0")
+        )
+        rounding = Decimal(str(currency.rounding))
+        if abs(amount) < rounding / Decimal("2") or abs(amount) > explained + (
+            rounding / Decimal("2")
+        ):
+            if line._check_line_unlink():
+                # Odoo keeps the lines of a confirmed order.
+                line.with_context(shopify_order_import=True).price_unit = 0
+            else:
+                line.unlink()
+            return
+        product = instance._ensure_delivery_product()
+        values = {
+            "order_id": sale_order.id,
+            "product_id": product.id,
+            "name": self.env._("Shopify discount rounding"),
+            "product_uom_qty": 1,
+            "product_uom_id": product.uom_id.id,
+            "price_unit": format(amount, "f"),
+            "discount": 0,
+            "tax_ids": [Command.clear()],
+            "shopify_discount_rounding": True,
+        }
+        if line:
+            line.with_context(shopify_order_import=True).write(values)
+        else:
+            self.env["sale.order.line"].with_company(
+                instance.company_id
+            ).with_context(shopify_order_import=True).create(values)
+
+    def _discount_rounding_drift(self, line):
+        """Return how much the stored discount percent moves the line total."""
+        if not line.shopify_expected_total or not line.discount:
+            return Decimal("0")
+        stored = Decimal(str(line.discount))
+        gross = Decimal(str(line.price_unit)) * Decimal(str(line.product_uom_qty))
+        if not gross or stored >= 100:
+            return Decimal("0")
+        exact = (
+            (gross - decimal_amount(line.shopify_expected_total))
+            * Decimal("100")
+            / gross
+        )
+        # price_total includes the taxes, so the drift includes them too.
+        return abs(
+            Decimal(str(line.price_total))
+            * (exact - stored)
+            / (Decimal("100") - stored)
+        )
 
     def _verify_total(self, sale_order, currency, instance, order_data):
         sale_order.invalidate_recordset(["amount_total"])

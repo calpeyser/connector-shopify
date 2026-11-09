@@ -349,6 +349,64 @@ class TestShopifyOrderSync(AccountTestInvoicingCommon):
         self.assertEqual(binding.state, "synced")
         self.assertEqual(binding.odoo_id.amount_total, 20)
 
+    def _large_discount_payload(self, order_id, total, discount="50.00", **values):
+        # 48 x 8.50 with $50.00 off: the exact discount is 12.2549 %, and
+        # Odoo stores 12.25 %, so its line total is 358.02.
+        payload = self._payload(
+            order_id=order_id, quantity=48, total=total, **values
+        )
+        line = payload["lineItems"]["nodes"][0]
+        line["originalUnitPriceSet"] = self._bag("8.50")
+        line["discountedUnitPriceAfterAllDiscountsSet"] = self._bag("7.46")
+        if discount:
+            line["discountAllocations"] = [{"allocatedAmountSet": self._bag(discount)}]
+        else:
+            line["discountedUnitPriceAfterAllDiscountsSet"] = self._bag("8.50")
+        return payload
+
+    def test_rounded_discount_percent_gets_a_rounding_line(self):
+        binding = self.order_model.browse(
+            self.order_model._job_import_order(
+                self.instance.id, self._large_discount_payload(31, "358.00")
+            )
+        )
+
+        self.assertEqual(binding.state, "synced")
+        order = binding.odoo_id
+        self.assertEqual(order.amount_total, 358)
+        rounding = order.order_line.filtered("shopify_discount_rounding")
+        self.assertEqual(len(rounding), 1)
+        self.assertAlmostEqual(rounding.price_total, -0.02)
+        self.assertEqual(rounding.product_id, self.instance.delivery_product_id)
+        self.assertFalse(rounding.tax_ids)
+
+        # A later edit that needs no rounding removes the line again.
+        self.order_model._job_import_order(
+            self.instance.id,
+            self._large_discount_payload(
+                31, "408.00", discount=None, updatedAt="2026-01-11T10:00:00Z"
+            ),
+        )
+        self.assertEqual(binding.state, "synced")
+        self.assertEqual(order.amount_total, 408)
+        self.assertFalse(order.order_line.filtered("shopify_discount_rounding"))
+
+    def test_mismatch_larger_than_discount_rounding_still_stops_import(self):
+        result = self.order_model._job_import_order(
+            self.instance.id, self._large_discount_payload(32, "357.90")
+        )
+
+        binding = self.order_model.search(
+            [
+                ("instance_id", "=", self.instance.id),
+                ("shopify_id", "=", "gid://shopify/Order/32"),
+            ]
+        )
+        self.assertFalse(result)
+        self.assertEqual(binding.state, "error")
+        self.assertIn("Order total mismatch", binding.error_message)
+        self.assertFalse(binding.odoo_id)
+
     def test_order_edit_after_delivery_is_rejected(self):
         binding_id = self.order_model._job_import_order(
             self.instance.id, self._payload(order_id=3)

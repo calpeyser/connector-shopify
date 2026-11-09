@@ -665,6 +665,7 @@ class SaleOrderLineShopify(models.Model):
     shopify_expected_total = fields.Char(readonly=True, copy=False)
     shopify_is_shipping = fields.Boolean(readonly=True, copy=False)
     shopify_is_gift_card = fields.Boolean(readonly=True, copy=False)
+    shopify_discount_rounding = fields.Boolean(readonly=True, copy=False)
 
 
 class StockPickingShopifyRisk(models.Model):
